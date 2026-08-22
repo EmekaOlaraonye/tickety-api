@@ -1,0 +1,18 @@
+# Never commit credentials. `firebase-admin.json` is a service-account private
+# key with full admin access to the project; the API now uses Application
+# Default Credentials instead, and the file should be deleted once ADC is set up
+# locally (`gcloud auth application-default login`).
+firebase-admin.json
+*-adminsdk-*.json
+service-account*.json
+.env
+.env.*
+!.env.example
+
+node_modules/
+coverage/
+*.log
+.DS_Store
+
+.idea/
+.claude/

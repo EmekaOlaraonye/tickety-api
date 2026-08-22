@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+coverage
+test
+.git
+.gitignore
+.idea
+*.md
+
+# Never let a credential into an image layer, even by accident.
+firebase-admin.json
+*-adminsdk-*.json
+service-account*.json
+.env
+.env.*
