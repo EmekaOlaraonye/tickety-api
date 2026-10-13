@@ -263,3 +263,38 @@ export async function listCustomers({ limit = 25, cursor = null } = {}) {
     total: null,
   };
 }
+
+/**
+ * The caller's own profile.
+ *
+ * Not `getCustomer(uid)` with a nicer name: a missing `Users` document is not
+ * a 404 here. The verified token is already proof the account exists, and the
+ * profile document is written by the app the first time someone saves their
+ * details — so a customer who signed up two minutes ago has a real account
+ * and no document. Answering "not found" when they ask about themselves reads
+ * as "your account is gone", which is both wrong and alarming.
+ *
+ * Identity comes from the token; names and phone number come from the
+ * document. `profileComplete` saves every client from re-deriving the same
+ * "should I show the finish-your-profile prompt?" test from empty strings.
+ */
+export async function getOwnProfile(uid, { email = null, emailVerified = false, role = null } = {}) {
+  const doc = await db.collection(COLLECTIONS.users).doc(uid).get();
+  const profile = doc.exists ? toCustomer(doc) : null;
+
+  return {
+    id: uid,
+    firstName: profile?.firstName ?? '',
+    lastName: profile?.lastName ?? '',
+    // The token's email is authoritative — it is what the person signs in
+    // with, and the document's copy can be stale.
+    email: email ?? profile?.email ?? '',
+    emailVerified,
+    phoneNumber: profile?.phoneNumber ?? '',
+    profilePicture: profile?.profilePicture ?? '',
+    // Null for an ordinary customer. Sent so a client can tell, from one
+    // request, whether the account it holds is also a staff account.
+    role,
+    profileComplete: Boolean(profile?.firstName && profile?.lastName),
+  };
+}

@@ -56,12 +56,25 @@ const writableEvent = {
 export default async function eventRoutes(fastify) {
   const manage = fastify.requireRole(ROLES.ADMIN, ROLES.ORGANISER);
 
+  /**
+   * Reading the catalogue needs a token, not a role.
+   *
+   * Three different clients read this list for three reasons: a customer
+   * browsing what is on sale, a door choosing which event it is working, and
+   * a dashboard managing a book of events. `requireRole` would turn the first
+   * of those into a 403.
+   *
+   * This grants nothing new. `firestore.rules` already says
+   * `allow read: if isSignedIn()` on the `Tickets` collection — the catalogue
+   * is public to anyone with an account, and has to be, because that is the
+   * shop window. Writes below stay on `manage`.
+   */
+  const browse = fastify.authenticate;
+
   fastify.get(
     '',
     {
-      // Scanners list events too — that is how the door picks which event it
-      // is working.
-      onRequest: fastify.requireRole(ROLES.ADMIN, ROLES.ORGANISER, ROLES.SCANNER),
+      onRequest: browse,
       schema: {
         tags: ['events'],
         summary: 'List events',
@@ -71,7 +84,9 @@ export default async function eventRoutes(fastify) {
             ...paginationQuery,
             organiserId: {
               type: 'string',
-              description: 'Admins only. Organisers always see their own.',
+              description:
+                'Filters to one organiser. Ignored for an organiser, whose ' +
+                'own scope always wins.',
             },
           },
         },
@@ -95,7 +110,7 @@ export default async function eventRoutes(fastify) {
   fastify.get(
     '/:id',
     {
-      onRequest: fastify.requireRole(ROLES.ADMIN, ROLES.ORGANISER, ROLES.SCANNER),
+      onRequest: browse,
       schema: {
         tags: ['events'],
         summary: 'Fetch one event',
@@ -106,7 +121,10 @@ export default async function eventRoutes(fastify) {
     async (request) => {
       const event = await events.get(request.params.id);
 
-      // A scanner may read any event; an organiser only their own.
+      // A customer or a scanner may read any event — one is shopping, the
+      // other is choosing a door. An organiser only their own, so a
+      // competitor's row cannot be fetched by id after being filtered out of
+      // the listing above.
       if (request.user.role === ROLES.ORGANISER) {
         fastify.assertOwns(request, event.organiserId);
       }

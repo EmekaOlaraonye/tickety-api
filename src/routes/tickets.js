@@ -1,4 +1,5 @@
 import { ROLES } from '../lib/roles.js';
+import * as events from '../services/event-service.js';
 import * as orders from '../services/order-service.js';
 import { errorResponses } from '../schemas/common.js';
 import { ticketResource } from './orders.js';
@@ -8,8 +9,9 @@ import { ticketResource } from './orders.js';
  *
  * There is no list here on purpose — the guest list already lives at
  * `/reports/events/:eventId/attendees`, and a second way to enumerate tickets
- * is a second thing that can leak one. What this file adds is the ability to
- * stop a single ticket, which nothing in the platform could do.
+ * is a second thing that can leak one. Everything here is addressed by a
+ * single id: look one up, stop it, or put it back. The holder's own view of
+ * the same seats, with the QR payload, is under `/me/tickets`.
  *
  * Voiding works without a scanner deploy: `redeemTicket` already refuses any
  * ticket whose status is not `valid`, so the write takes effect at every door
@@ -26,6 +28,50 @@ export default async function ticketRoutes(fastify) {
   // Admin-only. Voiding a ticket takes something away from a paying customer
   // and is felt at a door hours later, by someone who cannot appeal it there.
   const adminOnly = fastify.requireRole(ROLES.ADMIN);
+
+  fastify.get(
+    '/:ticketId',
+    {
+      // Scanners included, and this is the only staff route that admits them
+      // to a ticket document. A door that has just refused a scan has to be
+      // able to say why — admitted at 20:14, or voided — to someone standing
+      // in front of it who will otherwise be told "computer says no".
+      //
+      // One ticket, by an id the scanner only has because it scanned it, is a
+      // different thing from the guest list at
+      // `/reports/events/:eventId/attendees`, which stays off this role: that
+      // one enumerates who is coming, and this one answers a scan.
+      onRequest: fastify.requireRole(ROLES.ADMIN, ROLES.ORGANISER, ROLES.SCANNER),
+      schema: {
+        tags: ['tickets'],
+        summary: 'Look up one ticket',
+        description:
+          'Status and admission trail for a single seat. No `secret`: the ' +
+          'holder of a ticket gets that from /me/tickets, and nobody else ' +
+          'ever does — a leaked secret is a working ticket. Redemption still ' +
+          'goes through the redeemTicket function, which verifies the secret ' +
+          'itself.',
+        params: ticketParam,
+        response: { 200: ticketResource, ...errorResponses },
+      },
+    },
+    async (request) => {
+      const ticket = await orders.getTicket(request.params.ticketId);
+
+      // An organiser may only look up a seat for one of their own events.
+      // Without this, a ticket id is a way around the scoping that `/events`
+      // and `/reports` apply — one extra read is worth closing that.
+      //
+      // A ticket carrying no `eventId` is unattributable, so it fails closed:
+      // `assertOwns(null)` refuses every organiser rather than treating an
+      // orphaned record as common property.
+      if (request.user.role === ROLES.ORGANISER) {
+        const event = ticket.eventId ? await events.get(ticket.eventId) : null;
+        fastify.assertOwns(request, event?.organiserId ?? null);
+      }
+      return ticket;
+    }
+  );
 
   fastify.post(
     '/:ticketId/void',

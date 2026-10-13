@@ -42,6 +42,9 @@ describe('authentication', () => {
     ['GET', '/v1/orders'],
     ['GET', '/v1/orders/usr_1/ord_1'],
     ['GET', '/v1/users/usr_1/orders'],
+    // A ticket document is the one record a scanner may read directly, so the
+    // gate in front of it carries more than usual.
+    ['GET', '/v1/tickets/tkt_1'],
     // Voiding a ticket is felt at a door hours later by someone who cannot
     // appeal it there, so the gate in front of it must never regress.
     ['POST', '/v1/tickets/tkt_1/void'],
