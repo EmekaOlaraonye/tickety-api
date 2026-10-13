@@ -19,6 +19,8 @@ Firestore rules deliberately deny things a browser might want to do:
 | Read the guest list | `IssuedTickets` is denied to every client, because each document holds the ticket `secret` and a leaked secret is a working ticket. The API strips it. |
 | Create a scanner account | Setting a custom claim requires the Admin SDK. The old browser flow could not, so every account it created was unable to scan. |
 | Grant or revoke a role | Same — and a client that could set its own claims would have no security model at all. |
+| Look up any order | Orders live at `Users/{uid}/Orders/{id}`, and rules let a customer read only their own. Reading across customers is a collection-group query no client is allowed to make, so support had no way to find the order behind a payment complaint. |
+| Stop a single ticket | Writing `IssuedTickets` is denied to every client. Marking one `void` is what takes a stolen or charged-back ticket out of circulation — every door refuses anything whose status is not `valid`. |
 
 ## Roles
 
@@ -85,6 +87,9 @@ the server refuses to start in production without it.
 
 - `firebase-admin.json` is still present and should be **deleted and its key
   rotated**. It sat in an un-gitignored folder and grants full admin access.
-- The `Orders` collection-group index must be deployed for `/v1/reports/sales`.
+- The `Orders` collection-group index is written (`CustomerApp/ticketycustomer/firestore.indexes.json`,
+  as a `fieldOverrides` entry giving `orderDate` COLLECTION_GROUP scope) but is
+  **not yet deployed**. `/v1/orders` and a `since`-filtered `/v1/reports/sales`
+  fail until it is: `firebase deploy --only firestore:indexes`.
 - `firestore.rules` still tests `staff`; it should move to `role` once every
   client is issuing new tokens.

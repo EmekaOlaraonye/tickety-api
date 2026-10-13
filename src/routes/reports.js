@@ -143,8 +143,11 @@ export default async function reportRoutes(fastify) {
               truncated: {
                 type: 'boolean',
                 description:
-                  'True when the scan hit its cap; narrow the window with ' +
-                  '`since` for a complete figure.',
+                  'True when these totals are a floor rather than a final ' +
+                  'figure, for either reason: the order scan hit its cap — ' +
+                  'narrow the window with `since` — or, for an organiser with ' +
+                  'an implausibly large catalogue, the event enumeration did. ' +
+                  'Never present a truncated total as the answer.',
               },
             },
           },
@@ -156,17 +159,29 @@ export default async function reportRoutes(fastify) {
       const scope = fastify.scopeFor(request);
 
       // An organiser's revenue is defined by which events are theirs, so the
-      // event list is resolved first and used as the filter.
+      // full set of their event ids is resolved first and used as the filter.
+      // Every id, not the first page: taking one page of 100 meant an
+      // organiser with a larger catalogue lost the revenue from everything
+      // past it, and the response said nothing about the omission.
       let organiserEventIds = null;
+      let everyEventCounted = true;
+
       if (scope) {
-        const owned = await events.list({ organiserId: scope, limit: 100 });
-        organiserEventIds = new Set(owned.items.map((event) => event.id));
+        const owned = await events.listIdsFor(scope);
+        organiserEventIds = owned.ids;
+        everyEventCounted = owned.complete;
       }
 
-      return reports.sales({
+      const report = await reports.sales({
         organiserEventIds,
         since: request.query.since ? new Date(request.query.since) : null,
       });
+
+      // Two independent ways this figure can be short — the order scan's cap
+      // and the event enumeration's — and the caller needs to know about
+      // either, so they are reported through the one flag clients already act
+      // on rather than a second one they would have to learn.
+      return { ...report, truncated: report.truncated || !everyEventCounted };
     }
   );
 }

@@ -122,6 +122,55 @@ export async function list({ organiserId = null, limit = 25, cursor = null } = {
   };
 }
 
+/**
+ * Every event id belonging to one organiser.
+ *
+ * `list()` is paginated because a client renders one page at a time. This is
+ * the same question in the other shape, for a caller that needs the whole set
+ * before it can decide anything — `/reports/sales` uses it to work out which
+ * order lines are this organiser's.
+ *
+ * That caller used to take `list({ limit: 100 })` and treat the first page as
+ * the answer, so an organiser with more than a hundred events had the revenue
+ * from every event past the hundredth silently dropped from their total: no
+ * error, no flag, just a figure that was too small.
+ *
+ * `select()` with no field paths asks Firestore for document ids and nothing
+ * else, so walking a large catalogue costs a fraction of reading it.
+ *
+ * @returns {Promise<{ids: Set<string>, complete: boolean}>} `complete` is
+ *   false only when the cap was reached, which the caller has to report rather
+ *   than present the resulting figures as final.
+ */
+export async function listIdsFor(organiserId, { cap = 2000, pageSize = 300 } = {}) {
+  const ids = new Set();
+  let cursor = null;
+  let complete = false;
+
+  // A bound, not an expectation: an organiser with two thousand events is not
+  // a real account, and an unbounded loop here would be a way to make one
+  // request read the entire collection.
+  while (ids.size < cap) {
+    let query = collection().select().orderBy('__name__').limit(pageSize);
+
+    if (organiserId) query = query.where('organiserId', '==', organiserId);
+    if (cursor) query = query.startAfter(cursor);
+
+    const snapshot = await query.get();
+    for (const doc of snapshot.docs) ids.add(doc.id);
+
+    // A short page is the last page.
+    if (snapshot.size < pageSize) {
+      complete = true;
+      break;
+    }
+
+    cursor = snapshot.docs[snapshot.docs.length - 1].id;
+  }
+
+  return { ids, complete };
+}
+
 export async function get(id) {
   const doc = await collection().doc(id).get();
   if (!doc.exists) throw notFound(`No event with id ${id}.`);

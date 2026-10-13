@@ -91,13 +91,46 @@ async function authPlugin(fastify) {
   /**
    * Organiser scoping.
    *
-   * An organiser may only touch resources carrying their own `orgId`; an admin
-   * may touch any. Returns the orgId a listing should be filtered by, or null
-   * for "no filter" (admin).
+   * Returns the `orgId` a listing must be filtered by, or `null` meaning "no
+   * filter". Exactly two roles get `null`, both deliberately: an admin, who
+   * may see the whole platform, and a scanner, whose token carries no scope by
+   * design (see `claimsFor`) and which needs the full event list to choose the
+   * door it is working.
+   *
+   * An organiser always gets a real scope, or an error.
+   *
+   * Returning `null` for an organiser whose token carried no `orgId` was a
+   * read leak. Every caller treats `null` as "no filter", so such an account
+   * listed every organisation's catalogue through `GET /events` and counted
+   * every organisation's orders through `GET /reports/sales`. It could not
+   * *act* on any of it — `assertOwns` below already fails closed — but reading
+   * it is precisely what organiser scoping exists to prevent, and nothing in
+   * the response told the caller the figures were not their own.
+   *
+   * Failing closed beats returning a sentinel that matches no records: an
+   * unscoped organiser is a misconfigured account, and an empty list would
+   * leave them to guess why.
    */
   fastify.decorate('scopeFor', (request) => {
     if (request.user.role === ROLES.ADMIN) return null;
-    return request.user.orgId;
+
+    if (request.user.role === ROLES.ORGANISER) {
+      if (!request.user.orgId) {
+        // Worth a log line: this is a provisioning mistake someone has to fix,
+        // and the account will keep hitting it until they do.
+        request.log?.warn(
+          { uid: request.user.uid },
+          'organiser token carries no orgId; refusing rather than serving an unfiltered scope'
+        );
+        throw forbidden(
+          'This organiser account has no organisation set, so it owns nothing yet. ' +
+            'Ask an administrator to set your organisation.'
+        );
+      }
+      return request.user.orgId;
+    }
+
+    return null;
   });
 
   /** Throws unless the caller may act on a resource owned by `orgId`. */
