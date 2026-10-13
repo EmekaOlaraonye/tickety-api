@@ -224,6 +224,32 @@ export async function passwordResetLink(uid) {
  * customer to read only their own document, so that call was denied and the
  * table silently rendered empty.
  */
+/** One customer's profile document. */
+function toCustomer(doc) {
+  const data = doc.data() ?? {};
+  return {
+    id: doc.id,
+    firstName: data.FirstName ?? '',
+    lastName: data.LastName ?? '',
+    email: data.Email ?? '',
+    phoneNumber: data.PhoneNumber ?? '',
+    profilePicture: data.ProfilePicture ?? '',
+  };
+}
+
+/**
+ * One customer.
+ *
+ * Reads the profile document rather than the auth record: the panel's customer
+ * page is built around what the person bought, and the name on the order is
+ * the one stored here.
+ */
+export async function getCustomer(uid) {
+  const doc = await db.collection(COLLECTIONS.users).doc(uid).get();
+  if (!doc.exists) throw notFound('No such customer.');
+  return toCustomer(doc);
+}
+
 export async function listCustomers({ limit = 25, cursor = null } = {}) {
   let query = db.collection(COLLECTIONS.users).orderBy('__name__').limit(limit + 1);
   if (cursor) query = query.startAfter(cursor);
@@ -232,17 +258,7 @@ export async function listCustomers({ limit = 25, cursor = null } = {}) {
   const docs = snapshot.docs.slice(0, limit);
 
   return {
-    items: docs.map((doc) => {
-      const data = doc.data() ?? {};
-      return {
-        id: doc.id,
-        firstName: data.FirstName ?? '',
-        lastName: data.LastName ?? '',
-        email: data.Email ?? '',
-        phoneNumber: data.PhoneNumber ?? '',
-        profilePicture: data.ProfilePicture ?? '',
-      };
-    }),
+    items: docs.map(toCustomer),
     nextCursor: snapshot.docs.length > limit ? docs[docs.length - 1].id : null,
     total: null,
   };

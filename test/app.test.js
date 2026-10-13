@@ -39,6 +39,13 @@ describe('authentication', () => {
     ['GET', '/v1/organisers'],
     ['GET', '/v1/reports/sales'],
     ['GET', '/v1/reports/events/evt_1/attendees'],
+    ['GET', '/v1/orders'],
+    ['GET', '/v1/orders/usr_1/ord_1'],
+    ['GET', '/v1/users/usr_1/orders'],
+    // Voiding a ticket is felt at a door hours later by someone who cannot
+    // appeal it there, so the gate in front of it must never regress.
+    ['POST', '/v1/tickets/tkt_1/void'],
+    ['POST', '/v1/tickets/tkt_1/restore'],
   ];
 
   for (const [method, url] of protectedRoutes) {
@@ -104,6 +111,59 @@ describe('error shape', () => {
       assert.ok(!body.includes(leak), `response leaked "${leak}": ${body}`);
     }
     assert.ok(!('stack' in response.json()));
+  });
+});
+
+describe('organiser scoping', () => {
+  // The decorators are exercised directly: reaching them through a route would
+  // need a signed Firebase token, and what matters here is the decision they
+  // make about a token's claims, not the transport.
+  const as = (role, orgId = null) => ({ user: { uid: `uid_${role}`, role, orgId } });
+
+  test('an admin is unscoped, and sees the whole platform', () => {
+    assert.equal(app.scopeFor(as('admin')), null);
+  });
+
+  test('an organiser is scoped to their own organisation', () => {
+    assert.equal(app.scopeFor(as('organiser', 'org_9')), 'org_9');
+  });
+
+  test('an organiser with no orgId is refused, not silently unscoped', () => {
+    // The regression this file exists for. Returning null here read as "no
+    // filter" to every caller, so the account listed every organisation's
+    // events and counted every organisation's revenue.
+    assert.throws(
+      () => app.scopeFor(as('organiser')),
+      (error) => error.status === 403 && /no organisation set/i.test(error.detail)
+    );
+
+    assert.throws(() => app.scopeFor(as('organiser', '')), (error) => error.status === 403);
+  });
+
+  test('a scanner stays unscoped, because a door needs the whole event list', () => {
+    // Scanner tokens deliberately carry no orgId (see claimsFor). Folding them
+    // into the organiser rule above would 403 every door at sign-in.
+    assert.equal(app.scopeFor(as('scanner')), null);
+  });
+});
+
+describe('ownership', () => {
+  const as = (role, orgId = null) => ({ user: { uid: `uid_${role}`, role, orgId } });
+
+  test('an admin may act on anything', () => {
+    assert.doesNotThrow(() => app.assertOwns(as('admin'), 'org_9'));
+    assert.doesNotThrow(() => app.assertOwns(as('admin'), null));
+  });
+
+  test('an organiser may act only on their own records', () => {
+    assert.doesNotThrow(() => app.assertOwns(as('organiser', 'org_9'), 'org_9'));
+    assert.throws(() => app.assertOwns(as('organiser', 'org_9'), 'org_7'), (e) => e.status === 403);
+  });
+
+  test('an unscoped organiser owns nothing, including unowned legacy records', () => {
+    // null === null would otherwise hand them every record written before
+    // events carried an organiserId.
+    assert.throws(() => app.assertOwns(as('organiser'), null), (e) => e.status === 403);
   });
 });
 

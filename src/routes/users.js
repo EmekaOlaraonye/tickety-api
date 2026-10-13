@@ -1,5 +1,7 @@
 import { ROLES } from '../lib/roles.js';
 import * as accounts from '../services/account-service.js';
+import * as orders from '../services/order-service.js';
+import { orderResource } from './orders.js';
 import {
   errorResponses,
   idParam,
@@ -47,6 +49,43 @@ export default async function userRoutes(fastify) {
     },
     async (request) =>
       accounts.listCustomers({
+        limit: request.query.limit ?? 25,
+        cursor: request.query.cursor ?? null,
+      })
+  );
+
+  fastify.get(
+    '/:id',
+    {
+      onRequest: adminOnly,
+      schema: {
+        tags: ['users'],
+        summary: 'One customer',
+        params: idParam,
+        response: { 200: customerResource, ...errorResponses },
+      },
+    },
+    async (request) => accounts.getCustomer(request.params.id)
+  );
+
+  fastify.get(
+    '/:id/orders',
+    {
+      onRequest: adminOnly,
+      schema: {
+        tags: ['users', 'orders'],
+        summary: 'One customer’s order history',
+        description:
+          'Newest first. This is the answer to “what did this person actually ' +
+          'buy?”, which support could not ask before — orders were written and ' +
+          'then only ever summed.',
+        params: idParam,
+        querystring: { type: 'object', properties: { ...paginationQuery } },
+        response: { 200: pageSchema(orderResource), ...errorResponses },
+      },
+    },
+    async (request) =>
+      orders.listForUser(request.params.id, {
         limit: request.query.limit ?? 25,
         cursor: request.query.cursor ?? null,
       })

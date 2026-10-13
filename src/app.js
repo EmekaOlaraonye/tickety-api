@@ -14,6 +14,8 @@ import userRoutes from './routes/users.js';
 import scannerRoutes from './routes/scanners.js';
 import organiserRoutes from './routes/organisers.js';
 import reportRoutes from './routes/reports.js';
+import orderRoutes from './routes/orders.js';
+import ticketRoutes from './routes/tickets.js';
 
 /**
  * Builds the server without starting it.
@@ -114,6 +116,8 @@ export async function buildApp({ logger = true } = {}) {
         { name: 'scanners', description: 'Door accounts' },
         { name: 'organisers', description: 'Event organiser accounts' },
         { name: 'reports', description: 'Sales and attendance' },
+        { name: 'orders', description: 'What customers bought' },
+        { name: 'tickets', description: 'Individual issued tickets' },
       ],
     },
   });
@@ -134,6 +138,8 @@ export async function buildApp({ logger = true } = {}) {
       await api.register(scannerRoutes, { prefix: '/scanners' });
       await api.register(organiserRoutes, { prefix: '/organisers' });
       await api.register(reportRoutes, { prefix: '/reports' });
+      await api.register(orderRoutes, { prefix: '/orders' });
+      await api.register(ticketRoutes, { prefix: '/tickets' });
     },
     // Versioned from the start. The clients are shipped mobile apps that
     // cannot be force-updated, so there will eventually be two live versions.
