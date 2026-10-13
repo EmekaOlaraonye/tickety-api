@@ -1,13 +1,25 @@
 # Tickety API
 
-Fastify REST API holding every operation the Tickety clients cannot be trusted
-to do themselves: listing customers, managing the event catalogue, minting door
-and organiser accounts, granting roles, and reporting on sales and attendance.
+Fastify REST API: the server side of Tickety, for all four clients — the
+customer app (`ticketycustomer`), the door scanner (`ticketyscanner`), the
+admin panel (`ticketyadmin`) and the organiser dashboard (`ticketydash`).
 
-It backs the two React apps — **AdminPanel** (`ticketyadmin`) and
-**EventDashboard** (`ticketydash`). The two Flutter apps continue to reach
-Firebase directly and to call the `placeOrder`, `redeemTicket` and `gateStats`
-Cloud Functions.
+It holds two different kinds of operation, and they are guarded differently.
+
+**What a client cannot be trusted to do itself** — listing customers, managing
+the catalogue, minting door and organiser accounts, granting roles, stopping a
+ticket, reporting on sales and attendance. Guarded by `requireRole`: the `role`
+claim on the token decides.
+
+**What a client may only do to its own account** — read your profile, your
+orders, the seats you hold and the QR payload each one encodes. Everything
+under `/v1/me`, guarded by nothing but a valid token, because the uid inside it
+*is* the scope. No path under `/me` takes a user id, so there is no parameter
+to tamper with.
+
+The two Flutter apps still call the `placeOrder`, `redeemTicket`, `gateStats`
+and `closeAccount` Cloud Functions for every write. Reads are what moved here
+first; see [Migrating the Flutter clients](#migrating-the-flutter-clients).
 
 ## Why these live on a server
 
@@ -30,14 +42,71 @@ One `role` custom claim, set only by this API.
 |---|---|
 | `admin` | Everything, including granting roles and deleting accounts. |
 | `organiser` | Manage their own events, their own scanners, and see their own sales. Scoped by `orgId`. |
-| `scanner` | List events, read attendance. Redemption itself goes through the `redeemTicket` Cloud Function. |
-| _(none)_ | An ordinary customer. No access to this API. |
+| `scanner` | List events, read attendance, look up one scanned ticket. Redemption itself goes through the `redeemTicket` Cloud Function. |
+| _(none)_ | An ordinary customer. The catalogue, and their own account under `/v1/me`. |
+
+A customer has no role, which is why `requireRole` is not the only guard in the
+API. Two groups of routes ask for a token and no claim at all: `/v1/me/*`, and
+reading the catalogue — `firestore.rules` already grants every signed-in
+account `read` on `Tickets`, because that is the shop window.
 
 A legacy `staff: true` claim is emitted alongside `role` so that the deployed
 Cloud Functions and current `firestore.rules` — which both test `staff === true`
 — keep working during the migration. A token carrying only `staff` is read as
 `scanner`: the least-privileged role, so an old token keeps doors working
 without granting catalogue access.
+
+## The one place a ticket secret is served
+
+Every response schema in this API exists partly to stop the ticket `secret`
+escaping: Fastify serialises only declared properties, and no staff route
+declares it. `GET /v1/me/tickets` and `GET /v1/me/tickets/{id}` are the single
+exception, and they serve it as `qrPayload` — `TKT1:<ticketId>:<secret>`, ready
+to draw — to the account named on the ticket itself.
+
+That is not a new exposure. `firestore.rules` already lets a customer read
+their own `IssuedTickets` documents, because without the secret there is no QR
+to show at the door. What changes is who owns the *format*: the payload is
+assembled server-side, so a `TKT2` can ship without an app release. A ticket
+belonging to another account answers `404`, never `403` — a `403` would confirm
+the id exists, and the id is the half of the payload that can be read off a
+screen.
+
+Staff never get it. `GET /v1/tickets/{id}` returns status and the admission
+trail with no secret in it at all, which is what a door needs to explain a
+refused scan ("admitted at 20:14") to the person standing in front of it. The
+guest list at `/v1/reports/events/{id}/attendees` stays off the scanner role:
+one ticket in answer to a scan is not a list of who is coming.
+
+## Migrating the Flutter clients
+
+Reads moved first, writes have not moved at all. The apps are shipped binaries
+that cannot be force-updated, so both paths stay live until the installed base
+turns over.
+
+| Client call today | Replacement | Status |
+|---|---|---|
+| `Users/{uid}/Orders` query | `GET /v1/me/orders` | Available |
+| `IssuedTickets where userId ==` | `GET /v1/me/tickets` | Available |
+| `Users/{uid}` read | `GET /v1/me` | Available |
+| `Users/{uid}` write | — | Not ported; rules already allow a customer to edit their own profile |
+| `Tickets` collection read | `GET /v1/events` | Available |
+| `gateStats` callable | `GET /v1/reports/events/{id}/attendance` | Available |
+| `placeOrder` callable | — | Still the only writer of orders, tickets and stock |
+| `redeemTicket` callable | — | Still the only thing that admits a seat |
+| `closeAccount` callable | — | Not ported |
+
+Nothing here is blocked by security rules the way the admin panel's customer
+list was: a customer can already read all of their own data from the device.
+What the `/me` routes buy is that the storage layout — `Users/{uid}/Orders`,
+`IssuedTickets where userId ==`, `TKT1:$id:$secret` — stops being compiled into
+a phone. The next change to any of it ships from the server.
+
+The three write callables are deliberately untouched. They hold the money and
+the turnstile: pricing, tax by region, idempotency keys, 32-byte secret
+minting, and a Firestore transaction that decrements stock and mints seats
+together. Porting them is its own piece of work, with the old callables left
+deployed throughout.
 
 ## Running it
 
@@ -93,3 +162,18 @@ the server refuses to start in production without it.
   fail until it is: `firebase deploy --only firestore:indexes`.
 - `firestore.rules` still tests `staff`; it should move to `role` once every
   client is issuing new tokens.
+- The write path is still split. `placeOrder`, `redeemTicket` and
+  `closeAccount` speak the callable protocol (`{data: …}`, `HttpsError`) while
+  everything here speaks `problem+json`, so the Flutter apps handle two error
+  shapes. See [Migrating the Flutter clients](#migrating-the-flutter-clients).
+- `CORS_ORIGINS` covers the two React apps only. The Flutter clients are
+  native and send no `Origin`, so they are unaffected — but a Flutter **web**
+  build would need its origin added.
+- Rate limiting is keyed **per IP in practice, not per account**. The
+  `keyGenerator` prefers `request.user.uid`, but `@fastify/rate-limit` adds an
+  application-level `onRequest` hook and authentication is a route-level one,
+  so the limiter always runs first and `request.user` is still null. That was
+  harmless while the only clients were two browsers on office networks. With
+  the Flutter apps calling in, a carrier NAT puts thousands of customers in
+  one 300-per-minute bucket. Fixing it means moving authentication ahead of
+  the limiter, not trusting an unverified token for the key.

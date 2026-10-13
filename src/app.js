@@ -10,6 +10,7 @@ import authPlugin from './plugins/auth.js';
 import errorHandlerPlugin from './plugins/error-handler.js';
 import healthRoutes from './routes/health.js';
 import eventRoutes from './routes/events.js';
+import meRoutes from './routes/me.js';
 import userRoutes from './routes/users.js';
 import scannerRoutes from './routes/scanners.js';
 import organiserRoutes from './routes/organisers.js';
@@ -91,9 +92,12 @@ export async function buildApp({ logger = true } = {}) {
         title: 'Tickety API',
         version: '1.0.0',
         description:
-          'Privileged operations for the Tickety admin panel and event ' +
-          'dashboard. Every route requires a Firebase ID token; the role ' +
-          'claim on that token decides what it may do.',
+          'The server side of Tickety, for all four clients: the customer ' +
+          'app, the door scanner, the admin panel and the organiser ' +
+          'dashboard. Every route requires a Firebase ID token. The role ' +
+          'claim on that token decides what a staff account may do; routes ' +
+          'under /me need no role and serve whoever the token says is ' +
+          'calling.',
       },
       servers: [{ url: '/v1', description: 'Current version' }],
       components: {
@@ -111,6 +115,12 @@ export async function buildApp({ logger = true } = {}) {
       security: [{ firebaseIdToken: [] }],
       tags: [
         { name: 'health', description: 'Liveness and readiness' },
+        {
+          name: 'me',
+          description:
+            'The signed-in account’s own profile, orders and tickets. No role ' +
+            'required; scoped entirely by the uid in the token.',
+        },
         { name: 'events', description: 'The event catalogue' },
         { name: 'users', description: 'Customer accounts' },
         { name: 'scanners', description: 'Door accounts' },
@@ -134,6 +144,9 @@ export async function buildApp({ logger = true } = {}) {
   await app.register(
     async (api) => {
       await api.register(eventRoutes, { prefix: '/events' });
+      // Before `/users`, and a separate file, because `/me` is the one group
+      // of routes that needs no role at all — see routes/me.js.
+      await api.register(meRoutes, { prefix: '/me' });
       await api.register(userRoutes, { prefix: '/users' });
       await api.register(scannerRoutes, { prefix: '/scanners' });
       await api.register(organiserRoutes, { prefix: '/organisers' });

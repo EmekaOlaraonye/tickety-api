@@ -13,10 +13,17 @@ import { ROLES, hasRole, roleFromToken } from '../lib/roles.js';
  * can set. Nothing else about a request is trusted — not a header naming a
  * role, not a user id in a body, not the origin.
  *
+ * Two levels of access, not one. `requireRole` asks what an account *is* and
+ * guards everything a staff client does. `authenticate` on its own asks only
+ * that somebody is signed in, and guards the routes whose scope comes from the
+ * uid in the token rather than from a claim: the catalogue, and everything
+ * under `/me`. A customer has no `role`, so a role check is the wrong tool for
+ * the two clients most people use.
+ *
  * Decorates:
  *   `request.user`  — { uid, email, role, orgId } once authenticated.
- *   `fastify.authenticate`  — preHandler: requires a valid token.
- *   `fastify.requireRole(...)` — preHandler factory: requires one of the roles.
+ *   `fastify.authenticate`  — hook: requires a valid token, any account.
+ *   `fastify.requireRole(...)` — hook factory: requires one of the roles.
  */
 async function authPlugin(fastify) {
   fastify.decorateRequest('user', null);
@@ -92,10 +99,11 @@ async function authPlugin(fastify) {
    * Organiser scoping.
    *
    * Returns the `orgId` a listing must be filtered by, or `null` meaning "no
-   * filter". Exactly two roles get `null`, both deliberately: an admin, who
-   * may see the whole platform, and a scanner, whose token carries no scope by
+   * filter". Three kinds of caller get `null`, each deliberately: an admin,
+   * who may see the whole platform; a scanner, whose token carries no scope by
    * design (see `claimsFor`) and which needs the full event list to choose the
-   * door it is working.
+   * door it is working; and a customer, who has no role at all and browses the
+   * whole catalogue because that is the shop window.
    *
    * An organiser always gets a real scope, or an error.
    *

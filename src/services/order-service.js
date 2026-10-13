@@ -281,3 +281,233 @@ export async function setTicketStatus(ticketId, status, { actor = null, reason =
     });
   });
 }
+
+/* --------------------------------------------------------------------------
+ * The holder's own view
+ *
+ * Everything above this line answers "what did someone else buy?" and is read
+ * by staff. Everything below answers "what do I hold?", keyed on the uid in
+ * the caller's own token, and is read by the customer app.
+ *
+ * They are separate functions rather than one with a flag because they differ
+ * on the two things that matter most in this file — whether the ticket
+ * `secret` is included, and which of several totals is the honest one.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The QR format the scanner parses: `TKT1:<ticketId>:<secret>`.
+ *
+ * Assembled here rather than on the device so the format is owned by the
+ * server. `redeemTicket` rejects anything whose prefix is not this, and the
+ * shipped apps cannot be force-updated — so the day a `TKT2` is needed, a
+ * client that renders whatever this field contains keeps working, and one that
+ * concatenates the parts itself does not.
+ */
+const QR_PREFIX = 'TKT1';
+
+/**
+ * Issued ticket -> the resource its own holder gets.
+ *
+ * The one place in this API where a ticket secret is allowed out, and only
+ * ever to the uid stored on the ticket itself. That is not a new exposure:
+ * `firestore.rules` already lets a customer read their own `IssuedTickets`
+ * documents, because without the secret there is no QR to show at a door.
+ * What it replaces is the client knowing the collection name, the query shape
+ * and the payload format.
+ *
+ * Staff get `toTicketResource` instead, which has no secret in it at all —
+ * rules deny them the collection for exactly that reason.
+ */
+export function toHolderTicketResource(doc) {
+  const data = doc.data() ?? {};
+  const secret = typeof data.secret === 'string' ? data.secret : null;
+
+  return {
+    ticketId: doc.id,
+    orderId: data.orderId ?? '',
+    eventId: data.eventId ?? null,
+    // Denormalised onto the ticket when it was minted, so a wallet renders
+    // without a read per seat — and so a ticket still says what it admits you
+    // to after the event row has been edited.
+    eventTitle: String(data.eventTitle ?? '').trim(),
+    eventLocation: String(data.eventLocation ?? '').trim(),
+    eventStart: toDate(data.eventStart)?.toISOString() ?? null,
+    holderName: String(data.holderName ?? '').trim(),
+    seat: Math.trunc(toNumber(data.seat, 1)),
+    seatCount: Math.trunc(toNumber(data.seatCount, 1)),
+    status: String(data.status ?? 'valid'),
+    issuedAt: toDate(data.issuedAt)?.toISOString() ?? null,
+    redeemedAt: toDate(data.redeemedAt)?.toISOString() ?? null,
+    // Null rather than a half-built string for a ticket stored without one: a
+    // client drawing a QR from this must be able to tell the difference
+    // between "no secret" and a payload of `TKT1:id:`.
+    qrPayload: secret ? `${QR_PREFIX}:${doc.id}:${secret}` : null,
+  };
+}
+
+/**
+ * Order document -> the resource the customer who placed it gets.
+ *
+ * Deliberately not `toResource`. That one sums the line items and treats the
+ * result as authoritative, because an order can hold seats for two organisers
+ * and a sales report must attribute each line separately. A customer is owed
+ * the opposite figure: what their card was actually charged. Serving them a
+ * line-item sum would understate every order by its tax.
+ */
+export function toHolderOrderResource(doc) {
+  const data = doc.data() ?? {};
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  return {
+    orderId: doc.id,
+    placedAt: toDate(data.orderDate)?.toISOString() ?? null,
+    status: String(data.status ?? 'placed'),
+    subtotal: data.subtotal == null ? null : toNumber(data.subtotal),
+    tax: data.tax == null ? null : toNumber(data.tax),
+    total: data.totalAmount == null ? null : toNumber(data.totalAmount),
+    region: data.region ?? null,
+    paymentMethod: data.paymentMethod ?? null,
+    seats: items.reduce((sum, item) => sum + Math.trunc(toNumber(item?.quantity, 0)), 0),
+    items: items.map((item) => {
+      const quantity = Math.trunc(toNumber(item?.quantity, 0));
+      const price = toNumber(item?.price, 0);
+
+      return {
+        eventId: item?.ticketId ?? item?.eventId ?? null,
+        title: String(item?.title ?? '').trim(),
+        quantity,
+        price,
+        lineTotal: Math.round(quantity * price * 100) / 100,
+      };
+    }),
+  };
+}
+
+/** One customer's own order history, newest first. */
+export async function listOwnOrders(userId, { limit = 25, cursor = null } = {}) {
+  const ownOrders = db
+    .collection(COLLECTIONS.users)
+    .doc(userId)
+    .collection(COLLECTIONS.orders);
+
+  let query = ownOrders.orderBy('orderDate', 'desc').limit(limit + 1);
+
+  if (cursor) {
+    // Resolved inside this user's own subcollection rather than as a full
+    // document path: a cursor is caller-supplied, and `db.doc(cursor)` would
+    // happily accept one pointing into somebody else's history.
+    const anchor = await ownOrders.doc(cursor).get();
+    if (!anchor.exists) throw badRequest('That cursor no longer points at an order.');
+    query = query.startAfter(anchor);
+  }
+
+  const snapshot = await query.get();
+  const docs = snapshot.docs.slice(0, limit);
+
+  return {
+    items: docs.map(toHolderOrderResource),
+    nextCursor: snapshot.docs.length > limit ? docs[docs.length - 1].id : null,
+    total: null,
+  };
+}
+
+/**
+ * One of the caller's own orders, with the tickets it issued.
+ *
+ * Addressed by order id alone — the uid comes from the token, so there is no
+ * parameter here that could name another customer.
+ */
+export async function getOwnOrder(userId, orderId) {
+  const ref = db
+    .collection(COLLECTIONS.users)
+    .doc(userId)
+    .collection(COLLECTIONS.orders)
+    .doc(orderId);
+
+  const [doc, tickets] = await Promise.all([
+    ref.get(),
+    // Filtered on `userId` as well as `orderId`. Order ids are unique, but the
+    // one query in this file that returns secrets should not be relying on
+    // that to stay scoped to the caller.
+    db
+      .collection(COLLECTIONS.issuedTickets)
+      .where('userId', '==', userId)
+      .where('orderId', '==', orderId)
+      .get(),
+  ]);
+
+  if (!doc.exists) throw notFound(`No order ${orderId} on your account.`);
+
+  return {
+    ...toHolderOrderResource(doc),
+    tickets: tickets.docs.map(toHolderTicketResource).sort((a, b) => a.seat - b.seat),
+  };
+}
+
+/**
+ * Every seat the caller holds, most recently issued first.
+ *
+ * The same query the customer app runs against Firestore today, which is why
+ * it needs no new index: `IssuedTickets` on (`userId` ASC, `issuedAt` DESC) is
+ * already in `firestore.indexes.json` for exactly this.
+ */
+export async function listOwnTickets(userId, { limit = 25, cursor = null } = {}) {
+  const issued = db.collection(COLLECTIONS.issuedTickets);
+
+  let query = issued
+    .where('userId', '==', userId)
+    .orderBy('issuedAt', 'desc')
+    .limit(limit + 1);
+
+  if (cursor) {
+    const anchor = await issued.doc(cursor).get();
+
+    // A cursor naming someone else's ticket is refused rather than used. The
+    // `userId` filter would still scope the page correctly, but paging from a
+    // foreign anchor leaks that ticket's `issuedAt` through which of the
+    // caller's own tickets come back.
+    if (!anchor.exists || anchor.get('userId') !== userId) {
+      throw badRequest('That cursor no longer points at one of your tickets.');
+    }
+    query = query.startAfter(anchor);
+  }
+
+  const snapshot = await query.get();
+  const docs = snapshot.docs.slice(0, limit);
+
+  return {
+    items: docs.map(toHolderTicketResource),
+    nextCursor: snapshot.docs.length > limit ? docs[docs.length - 1].id : null,
+    total: null,
+  };
+}
+
+/** One of the caller's own tickets, with the payload its QR encodes. */
+export async function getOwnTicket(userId, ticketId) {
+  const doc = await db.collection(COLLECTIONS.issuedTickets).doc(ticketId).get();
+
+  // Someone else's ticket is reported missing, not forbidden. A 403 would
+  // confirm that a given ticket id exists, and the id is one half of the QR
+  // payload — the half an attacker can read off a screen.
+  if (!doc.exists || doc.get('userId') !== userId) {
+    throw notFound('No such ticket on your account.');
+  }
+
+  return toHolderTicketResource(doc);
+}
+
+/**
+ * One ticket, as staff see it: no secret.
+ *
+ * This is the lookup a door needs when a scan is refused — the scanner holds
+ * an id and has to tell the person in front of it *why*: already admitted at
+ * 20:14, or voided, or issued for tomorrow. The guest list at
+ * `/reports/events/:eventId/attendees` stays off the scanner role; one ticket
+ * at a time, in answer to a scan, is not a list of who is coming.
+ */
+export async function getTicket(ticketId) {
+  const doc = await db.collection(COLLECTIONS.issuedTickets).doc(ticketId).get();
+  if (!doc.exists) throw notFound('No such ticket.');
+
+  return toTicketResource(doc);
+}
