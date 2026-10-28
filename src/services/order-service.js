@@ -1,4 +1,4 @@
-import { Timestamp } from 'firebase-admin/firestore';
+import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 
 import { COLLECTIONS, db } from '../lib/firebase.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
@@ -78,6 +78,9 @@ export function toResource(doc, { customer = null } = {}) {
     total: Math.round(total * 100) / 100,
     storedTotal: data.totalAmount == null ? null : toNumber(data.totalAmount),
     status: String(data.status ?? 'placed'),
+    refundedAt: toDate(data.refundedAt)?.toISOString() ?? null,
+    refundedBy: data.refundedBy ?? null,
+    refundReason: data.refundReason ?? null,
     items: lines,
   };
 }
@@ -279,6 +282,125 @@ export async function setTicketStatus(ticketId, status, { actor = null, reason =
       id: doc.id,
       data: () => ({ ...(doc.data() ?? {}), ...patch }),
     });
+  });
+}
+
+/**
+ * Refunds an order: stops its tickets and returns the seats to sale.
+ *
+ * No money moves here, because no money moved through this API in the first
+ * place — an order records a `paymentMethod` and a total, and the payment
+ * itself happens outside the platform. A refund is therefore a records
+ * operation: the order is marked refunded, every seat it issued is voided, and
+ * the stock goes back. Settling the actual payment stays a human job, which is
+ * why `reason` is kept — it is the only trace of why the money left.
+ *
+ * Three rules decide the hard cases:
+ *
+ * 1. **An admitted seat blocks the refund.** `setTicketStatus` already refuses
+ *    to void a redeemed ticket, because attendance figures are derived from
+ *    that field and rewriting it misstates what happened at the gate. The same
+ *    holds in bulk: if any seat on the order was used, the refund is refused
+ *    rather than half-applied, and the message says how many.
+ * 2. **Already-void seats are left alone** rather than voided twice, so a
+ *    refund after a manual void is not a conflict — the end state is the same.
+ * 3. **Stock returns per event**, not per order. A mixed order spanning two
+ *    organisers' events puts each one's seats back on its own event, and a
+ *    ticket carrying no `eventId` restocks nothing, because there is nothing
+ *    it could honestly be credited to.
+ *
+ * `FieldValue.increment` rather than read-then-add: two refunds landing at once
+ * would otherwise both read the same stock and write the same total, losing a
+ * seat. The increment is applied by the server and cannot race.
+ *
+ * Every read happens before the first write, as a Firestore transaction
+ * requires — the event documents are read only once the tickets have named
+ * them.
+ */
+export async function refund(userId, orderId, { actor = null, reason = null } = {}) {
+  const orderRef = db
+    .collection(COLLECTIONS.users)
+    .doc(userId)
+    .collection(COLLECTIONS.orders)
+    .doc(orderId);
+
+  const ticketQuery = db.collection(COLLECTIONS.issuedTickets).where('orderId', '==', orderId);
+
+  return db.runTransaction(async (transaction) => {
+    // --- reads ---
+    const orderDoc = await transaction.get(orderRef);
+    if (!orderDoc.exists) throw notFound(`No order ${orderId} for that customer.`);
+
+    const current = String(orderDoc.get('status') ?? 'placed');
+    if (current === 'refunded') {
+      throw conflict('That order has already been refunded.');
+    }
+
+    const ticketSnapshot = await transaction.get(ticketQuery);
+    const tickets = ticketSnapshot.docs;
+
+    const admitted = tickets.filter((doc) => String(doc.get('status') ?? 'valid') === 'redeemed');
+    if (admitted.length > 0) {
+      throw conflict(
+        `${admitted.length} of ${tickets.length} seats on this order were admitted at the door. ` +
+          'Refunding would misstate the attendance record, so it has been refused — settle this one by hand.'
+      );
+    }
+
+    const toVoid = tickets.filter((doc) => String(doc.get('status') ?? 'valid') !== 'void');
+
+    // Seats to put back, grouped by the event that sold them.
+    const seatsByEvent = new Map();
+    for (const doc of toVoid) {
+      const eventId = doc.get('eventId');
+      if (!eventId) continue;
+      seatsByEvent.set(eventId, (seatsByEvent.get(eventId) ?? 0) + 1);
+    }
+
+    const eventRefs = [...seatsByEvent.keys()].map((id) =>
+      db.collection(COLLECTIONS.events).doc(id)
+    );
+    const eventDocs = await Promise.all(eventRefs.map((ref) => transaction.get(ref)));
+
+    // --- writes ---
+    const now = Timestamp.now();
+    const voidReason = reason ?? 'Order refunded';
+
+    for (const doc of toVoid) {
+      transaction.update(doc.ref, {
+        status: 'void',
+        voidedAt: now,
+        voidedBy: actor,
+        voidReason,
+      });
+    }
+
+    const restocked = [];
+    for (const eventDoc of eventDocs) {
+      // An event deleted since the order was placed has nothing to restock.
+      // The refund still stands; the seats simply have nowhere to go back to.
+      if (!eventDoc.exists) continue;
+
+      const seats = seatsByEvent.get(eventDoc.id) ?? 0;
+      transaction.update(eventDoc.ref, { Stock: FieldValue.increment(seats) });
+      restocked.push({ eventId: eventDoc.id, seats });
+    }
+
+    const patch = {
+      status: 'refunded',
+      refundedAt: now,
+      refundedBy: actor,
+      refundReason: reason,
+    };
+    transaction.update(orderRef, patch);
+
+    const order = toResource({
+      id: orderDoc.id,
+      ref: orderRef,
+      data: () => ({ ...(orderDoc.data() ?? {}), ...patch }),
+    });
+
+    return { order, voidedSeats: toVoid.length, restocked };
   });
 }
 

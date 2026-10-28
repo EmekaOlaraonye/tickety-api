@@ -47,6 +47,9 @@ describe('authentication', () => {
     ['GET', '/v1/tickets/tkt_1'],
     // Voiding a ticket is felt at a door hours later by someone who cannot
     // appeal it there, so the gate in front of it must never regress.
+    // Refunding voids seats and moves stock, so the gate in front of it
+    // matters as much as the one in front of voiding.
+    ['POST', '/v1/orders/usr_1/ord_1/refund'],
     ['POST', '/v1/tickets/tkt_1/void'],
     ['POST', '/v1/tickets/tkt_1/restore'],
   ];
