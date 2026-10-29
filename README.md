@@ -141,6 +141,14 @@ npm test
   `secret` escaping.
 - **Auth runs in `onRequest`**, before body parsing, so an anonymous caller gets
   `401` rather than a `400` that reveals the schema.
+- **Hook order is deliberate.** Three things run before any handler, in this
+  order: the auth plugin identifies the caller if it can and refuses nobody;
+  the rate limiter counts the request; then the route's own guard decides
+  whether to allow it. Identification has to come first so the limiter can key
+  on an account rather than an address, and the limiter has to come before the
+  guard or the traffic a guard rejects would never be counted. Both are
+  application-level hooks for that reason — route-level hooks, which is how
+  every guard is attached, run last.
 
 ## Deploying
 
@@ -169,11 +177,7 @@ the server refuses to start in production without it.
 - `CORS_ORIGINS` covers the two React apps only. The Flutter clients are
   native and send no `Origin`, so they are unaffected — but a Flutter **web**
   build would need its origin added.
-- Rate limiting is keyed **per IP in practice, not per account**. The
-  `keyGenerator` prefers `request.user.uid`, but `@fastify/rate-limit` adds an
-  application-level `onRequest` hook and authentication is a route-level one,
-  so the limiter always runs first and `request.user` is still null. That was
-  harmless while the only clients were two browsers on office networks. With
-  the Flutter apps calling in, a carrier NAT puts thousands of customers in
-  one 300-per-minute bucket. Fixing it means moving authentication ahead of
-  the limiter, not trusting an unverified token for the key.
+- Everything shares one limit: 300 requests per minute, per account or per
+  address. A door scanning a queue and an anonymous prober are held to the
+  same figure, which is generous for the second. Splitting them is easy — the
+  limiter takes a function for `max` — but worth measuring real traffic first.
