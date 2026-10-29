@@ -73,15 +73,65 @@ export async function buildApp({ logger = true } = {}) {
     maxAge: 86_400,
   });
 
+  // Before the rate limiter, and that order is load-bearing: the auth plugin
+  // installs the `onRequest` hook that identifies the caller, and the limiter
+  // below needs a caller to key on.
+  await app.register(authPlugin);
+
   await app.register(fastifyRateLimit, {
+    /**
+     * Not installed per route, which is the whole point of this block.
+     *
+     * Left global, `@fastify/rate-limit` hooks itself in through `onRoute` and
+     * *appends* its handler to each route's own `onRequest` array. The guards
+     * in this API are route-level hooks, so the resulting order is
+     * `[requireRole, limiter]` — and a request the guard refuses throws before
+     * the limiter is ever reached. Authenticated traffic was counted
+     * correctly; everything rejected at the gate was not counted at all.
+     *
+     * Which is the traffic that most needs a limit. An anonymous caller is
+     * refused by `authenticate` in microseconds and costs nothing to serve —
+     * except that this runs on Cloud Run, where every request is billed and
+     * instances scale out to meet whatever arrives. A flood of tokenless
+     * requests was unbounded, and so was a scan for routes that do not exist.
+     */
+    global: false,
     max: config.rateLimitMax,
     timeWindow: config.rateLimitWindowMs,
-    // Per-account when we know who is calling, per-IP otherwise, so one busy
-    // office behind a single NAT does not throttle itself.
-    keyGenerator: (request) => request.user?.uid ?? request.ip,
+    /**
+     * Per account when we know who is calling, per address when we do not.
+     *
+     * Namespaced so a uid can never collide with an address, and so a 429 in
+     * the log says which kind of caller was throttled. `request.ip` is only
+     * as trustworthy as `trustProxy` makes it — on Cloud Run the load
+     * balancer rewrites `X-Forwarded-For`, but it is a client-supplied header
+     * anywhere else, which is the other reason to prefer the uid.
+     */
+    keyGenerator: (request) =>
+      request.user?.uid ? `uid:${request.user.uid}` : `ip:${request.ip}`,
   });
 
-  await app.register(authPlugin);
+  /**
+   * The limiter, as an application-level hook so it runs ahead of the guards.
+   *
+   * `app.rateLimit()` is the same handler the plugin would have attached per
+   * route, with the same store and counters — only positioned where it sees
+   * every request, including the ones no route accepts.
+   *
+   * It honours a route's own `config.rateLimit: false`, because the plugin's
+   * `onRoute` wiring is no longer there to do it. The liveness and readiness
+   * probes rely on that: they are polled constantly, from an address this
+   * process cannot predict, and throttling them would have Cloud Run recycle
+   * instances that are perfectly healthy.
+   */
+  const limiter = app.rateLimit();
+
+  app.addHook('onRequest', async (request, reply) => {
+    const routeConfig = request.routeOptions?.config ?? request.routeConfig;
+    if (routeConfig?.rateLimit === false) return;
+
+    return limiter(request, reply);
+  });
 
   await app.register(fastifySwagger, {
     // Generated from the route schemas rather than a hand-maintained

@@ -28,6 +28,23 @@ import { ROLES, hasRole, roleFromToken } from '../lib/roles.js';
 async function authPlugin(fastify) {
   fastify.decorateRequest('user', null);
 
+  /** The token out of `Authorization: Bearer <token>`, or null. */
+  function bearerToken(request) {
+    const [scheme, token] = (request.headers.authorization ?? '').split(' ');
+    return scheme === 'Bearer' && token ? token : null;
+  }
+
+  /** Decoded token -> the only identity the rest of the API trusts. */
+  function userFrom(decoded) {
+    return {
+      uid: decoded.uid,
+      email: decoded.email ?? null,
+      emailVerified: decoded.email_verified === true,
+      role: roleFromToken(decoded),
+      orgId: typeof decoded.orgId === 'string' ? decoded.orgId : null,
+    };
+  }
+
   /**
    * Verifies the bearer token.
    *
@@ -36,12 +53,15 @@ async function authPlugin(fastify) {
    * than up to an hour later when the token would expire on its own. It costs
    * a lookup per request, which is the right trade for an API that can mint
    * accounts and grant roles.
+   *
+   * Returns immediately when `identify` below has already done the work, so
+   * that lookup happens once per request and not once per guard.
    */
   fastify.decorate('authenticate', async (request) => {
-    const header = request.headers.authorization ?? '';
-    const [scheme, token] = header.split(' ');
+    if (request.user) return;
 
-    if (scheme !== 'Bearer' || !token) {
+    const token = bearerToken(request);
+    if (!token) {
       throw unauthorized('Provide a Firebase ID token as a Bearer token.');
     }
 
@@ -57,14 +77,43 @@ async function authPlugin(fastify) {
         : unauthorized('That token is not valid.');
     }
 
-    request.user = {
-      uid: decoded.uid,
-      email: decoded.email ?? null,
-      emailVerified: decoded.email_verified === true,
-      role: roleFromToken(decoded),
-      orgId: typeof decoded.orgId === 'string' ? decoded.orgId : null,
-    };
+    request.user = userFrom(decoded);
   });
+
+  /**
+   * Identifies the caller if it can, and refuses nobody.
+   *
+   * Registered as an application-level `onRequest` hook, which runs before
+   * every route-level one. That exists for the rate limiter: the limiter has
+   * to count a request *before* a guard can refuse it, or anonymous traffic
+   * goes uncounted, and once it sits that early the only way it can key on an
+   * account is if somebody has already worked out which account that is.
+   *
+   * It must never throw. It runs in front of `/healthz`, `/readyz` and
+   * `/docs`, none of which take a token, and rejecting here would take the
+   * liveness probe down with it. A token that is missing, malformed, expired
+   * or revoked simply leaves `request.user` null and the decision to the
+   * route's own guard, which produces the right 401 with the right message.
+   *
+   * It does not widen access. Setting `request.user` grants nothing on its
+   * own: every route still states its own requirement, and a route with no
+   * guard is as unreachable to a customer as it was before.
+   */
+  fastify.decorate('identify', async (request) => {
+    const token = bearerToken(request);
+    if (!token) return;
+
+    try {
+      request.user = userFrom(await auth.verifyIdToken(token, true));
+    } catch {
+      // Deliberately silent at this level, and deliberately not logged: an
+      // expired token on a phone that has been in a pocket all night is
+      // routine, and the guard that refuses it will log the refusal itself.
+      request.user = null;
+    }
+  });
+
+  fastify.addHook('onRequest', fastify.identify);
 
   /**
    * Requires one of `allowed`. Authenticates first, so a route only needs this.
